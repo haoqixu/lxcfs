@@ -66,6 +66,8 @@ enum {
 	LXC_TYPE_PROC_STAT,
 	LXC_TYPE_PROC_DISKSTATS,
 	LXC_TYPE_PROC_SWAPS,
+	LXC_TYPE_SYS_FILE,
+	LXC_TYPE_SYS_DIR,
 };
 
 struct file_info {
@@ -77,6 +79,7 @@ struct file_info {
 	int buflen;
 	int size; //actual data size
 	int cached;
+	int fd; 
 };
 
 /* Reserve buffer size to account for file size changes. */
@@ -4232,6 +4235,188 @@ int proc_read(const char *path, char *buf, size_t size, off_t offset,
 	}
 }
 
+
+/*
+ * FUSE ops for /sys
+ */
+
+int sys_getattr(const char *path, struct stat *sb)
+{
+	struct timespec now;
+	struct fuse_context *fc = fuse_get_context();
+	struct stat _sb;
+
+
+	if (!fc)
+		return -EIO;
+
+	memset(sb, 0, sizeof(struct stat));
+
+	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+		return -EINVAL;
+
+	if (lstat(path, &_sb) < 0)
+		return -errno;
+
+	*sb = _sb;
+	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
+	sb->st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
+
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+
+	return 0;
+}
+
+int sys_opendir(const char *path, struct fuse_file_info *fi)
+{
+	struct fuse_context *fc = fuse_get_context();
+	struct file_info *dir_info;
+	int fd;
+
+	if (!fc)
+		return -EIO;
+
+	if ((fd = open(path, O_DIRECTORY | O_RDONLY)) < 0)
+		return -errno;
+
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+
+	/* TODO: check the permissions */
+
+	/* we'll free this at sys_releasedir */
+	dir_info = malloc(sizeof(*dir_info));
+	if (!dir_info)
+		return -ENOMEM;
+	dir_info->controller = NULL;
+	dir_info->cgroup = NULL;
+	dir_info->type = LXC_TYPE_SYS_DIR;
+	dir_info->buf = NULL;
+	dir_info->file = NULL;
+	dir_info->buflen = 0;
+	dir_info->fd = fd;
+
+	fi->fh = (unsigned long)dir_info;
+	return 0;
+}
+
+int sys_releasedir(const char *path, struct fuse_file_info *fi)
+{
+	struct file_info *dir_info = (struct file_info *)fi->fh;
+	close(dir_info->fd);
+
+	do_release_file_info(fi);
+	return 0;
+}
+
+int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
+		struct fuse_file_info *fi)
+{
+	int n, i, ret;
+	struct dirent **namelist;
+	struct file_info *d = (struct file_info *)fi->fh;
+
+	if (d->type != LXC_TYPE_SYS_DIR) {
+		lxcfs_error("%s\n", "Internal error: file cache info used in readdir.");
+		return -EIO;
+	}
+
+	/** TODO: implement filter function */
+	if ((n = scandir(path, &namelist, NULL, alphasort)) < 0)
+		return -errno;
+
+	ret = 0;
+	for (i = 0; i < n; i++) {
+		if (filler(buf, namelist[i]->d_name, NULL, 0) != 0)
+			ret = -EIO;
+		free(namelist[i]);
+	}
+	free(namelist);
+	return ret;
+}
+
+int sys_access(const char *path, int mask)
+{
+	if (access(path, mask) != 0)
+		return -errno;
+
+	/* files under /sys are readonly */
+	if ((mask & W_OK) != 0)
+		return -EACCES;
+	return 0;
+}
+
+int sys_open(const char *path, struct fuse_file_info *fi)
+{
+	struct file_info *file_info;
+	struct fuse_context *fc = fuse_get_context();
+	int fd;
+
+	if (!fc)
+		return -EIO;
+
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+
+        /* files under /sys are readonly */
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
+		return -EACCES;
+
+	if ((fd = open(path, O_RDONLY)) < 0)
+		return -errno;
+
+	/* we'll free this at sys_release */
+	file_info = malloc(sizeof(*file_info));
+	if (!file_info) {
+		return -ENOMEM;
+	}
+	file_info->controller = NULL;
+	file_info->cgroup = NULL;
+	file_info->file = NULL;
+	file_info->type = LXC_TYPE_SYS_FILE;
+	file_info->buf = NULL;
+	file_info->buflen = 0;
+	file_info->fd = fd;
+
+	fi->fh = (unsigned long)file_info;
+
+	return 0;
+}
+
+int sys_release(const char *path, struct fuse_file_info *fi)
+{
+	struct file_info *file_info = (struct file_info *)fi->fh;
+	close(file_info->fd);
+
+	do_release_file_info(fi);
+	return 0;
+}
+
+int sys_read(const char *path, char *buf, size_t size, off_t offset,
+		struct fuse_file_info *fi)
+{
+	struct file_info *f = (struct file_info *)fi->fh;
+
+	if (f->type != LXC_TYPE_SYS_FILE) {
+		lxcfs_error("%s\n", "Internal error: directory cache info used in sys_read.");
+		return -EIO;
+	}
+
+	return read(f->fd, buf, size);
+}
+
+int sys_readlink(const char *path, char *buf, size_t size)
+{
+	if (readlink(path, buf, size) == -1)
+		return -errno;
+	return 0;
+}
+
+
 /*
  * Functions needed to setup cgroups in the __constructor__.
  */
@@ -4464,7 +4649,7 @@ static bool permute_root(void)
 static int preserve_mnt_ns(int pid)
 {
 	int ret;
-	size_t len = sizeof("/proc/") + 21 + sizeof("/ns/mnt");
+	size_t len = sizeof("/proc/") + LXCFS_NUMSTRLEN64 + sizeof("/ns/mnt");
 	char path[len];
 
 	ret = snprintf(path, len, "/proc/%d/ns/mnt", pid);
