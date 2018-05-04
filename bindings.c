@@ -4411,8 +4411,11 @@ int sys_read(const char *path, char *buf, size_t size, off_t offset,
 
 int sys_readlink(const char *path, char *buf, size_t size)
 {
-	if (readlink(path, buf, size) == -1)
+	ssize_t nbyte;
+
+	if ((nbyte = readlink(path, buf, size)) == -1)
 		return -errno;
+	buf[nbyte] = '\0';
 	return 0;
 }
 
