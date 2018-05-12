@@ -68,12 +68,18 @@ enum {
 	LXC_TYPE_PROC_SWAPS,
 	LXC_TYPE_SYS_FILE,
 	LXC_TYPE_SYS_DIR,
+	LXC_TYPE_SYS_CPU_LIST,
+	LXC_TYPE_SYS_CPU_MAP,
+	LXC_TYPE_SYS_MEM_LIST,
+	LXC_TYPE_SYS_EMPTY,
 };
 
 struct file_info {
 	char *controller;
 	char *cgroup;
 	char *file;
+	char *cpus;  /* cpuset.cpus */
+	char *mems;  /* cpuset.mems */
 	int type;
 	char *buf;  // unused as of yet
 	int buflen;
@@ -4240,8 +4246,23 @@ int proc_read(const char *path, char *buf, size_t size, off_t offset,
  * FUSE ops for /sys
  */
 
+static inline bool cpuset_file_filter(const char *file, const char *cpus)
+{
+	int cpu;
+
+	if (sscanf(file, "cpu%d", &cpu) == 1 && !cpu_in_cpuset(cpu, cpus))
+		return false;
+	return true;
+}
+
+static bool dev_isvisible(int type, int maj, int min)
+{}
+
+
 int sys_getattr(const char *path, struct stat *sb)
 {
+	int ret = 0;
+	char *cpus = NULL, *mems = NULL;
 	struct timespec now;
 	struct fuse_context *fc = fuse_get_context();
 	struct stat _sb;
@@ -4250,47 +4271,96 @@ int sys_getattr(const char *path, struct stat *sb)
 	if (!fc)
 		return -EIO;
 
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+
+	/* cpus, mems must be freed when sys_getattr returns */
+	char *cg = get_pid_cgroup(initpid, "cpuset");
+	if (cg) {
+		prune_init_slice(cg);
+		/* cpus, mems are freed in sys_releasedir */
+		cpus = get_cpuset(cg);
+		if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems))
+			mems = NULL;
+		free(cg);
+	}
+
+	/* TODO: */
+	if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) {
+		ret = -ENOENT;
+		goto err;
+	}
+
 	memset(sb, 0, sizeof(struct stat));
 
-	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
-		return -EINVAL;
+	if (clock_gettime(CLOCK_REALTIME, &now) < 0) {
+		ret = -EINVAL;
+		goto err;
+	}
 
-	if (lstat(path, &_sb) < 0)
-		return -errno;
+	if (lstat(path, &_sb) < 0) {
+		ret = -errno;
+		goto err;
+	}
 
 	*sb = _sb;
 	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
 	sb->st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
 
-	pid_t initpid = lookup_initpid_in_store(fc->pid);
-	if (initpid <= 0)
-		initpid = fc->pid;
-
+err:
+	if (cpus)
+		free(cpus);
+	if (mems)
+		free(mems);
 	return 0;
 }
 
 int sys_opendir(const char *path, struct fuse_file_info *fi)
 {
-	struct fuse_context *fc = fuse_get_context();
-	struct file_info *dir_info;
 	int fd;
+	int ret = 0;
+	char *cpus = NULL, *mems = NULL;
+	struct file_info *dir_info;
+	struct fuse_context *fc = fuse_get_context();
 
-	if (!fc)
-		return -EIO;
+	if (!fc) {
+		ret = -EIO;
+		goto err;
+	}
 
-	if ((fd = open(path, O_DIRECTORY | O_RDONLY)) < 0)
-		return -errno;
+	fd = open(path, O_DIRECTORY | O_RDONLY);
+	if (fd < 0) {
+		ret =  -errno;
+		goto err;
+	}
 
 	pid_t initpid = lookup_initpid_in_store(fc->pid);
 	if (initpid <= 0)
 		initpid = fc->pid;
 
-	/* TODO: check the permissions */
+	char *cg = get_pid_cgroup(initpid, "cpuset");
+	if (cg) {
+		prune_init_slice(cg);
+		/* cpus, mems are freed in sys_releasedir */
+		cpus = get_cpuset(cg);
+		if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems))
+			mems = NULL;
+		free(cg);
+	}
+
+	/* TODO: fillter files of offline CPUs and nodes */
+	if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) {
+		ret = -ENOENT;
+		goto err;
+	}
 
 	/* we'll free this at sys_releasedir */
 	dir_info = malloc(sizeof(*dir_info));
-	if (!dir_info)
-		return -ENOMEM;
+	if (!dir_info) {
+		ret = -ENOMEM;
+		goto err;
+	}
 	dir_info->controller = NULL;
 	dir_info->cgroup = NULL;
 	dir_info->type = LXC_TYPE_SYS_DIR;
@@ -4298,15 +4368,28 @@ int sys_opendir(const char *path, struct fuse_file_info *fi)
 	dir_info->file = NULL;
 	dir_info->buflen = 0;
 	dir_info->fd = fd;
+	dir_info->cpus = cpus;
+	dir_info->mems = mems;
 
 	fi->fh = (unsigned long)dir_info;
 	return 0;
+
+err:
+	if (cpus)
+		free(cpus);
+	if (mems)
+		free(mems);
+	return ret;
 }
 
 int sys_releasedir(const char *path, struct fuse_file_info *fi)
 {
 	struct file_info *dir_info = (struct file_info *)fi->fh;
 	close(dir_info->fd);
+	if (dir_info->cpus)
+		free(dir_info->cpus);
+	if (dir_info->mems)
+		free(dir_info->mems);
 
 	do_release_file_info(fi);
 	return 0;
@@ -4330,8 +4413,10 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 
 	ret = 0;
 	for (i = 0; i < n; i++) {
-		if (filler(buf, namelist[i]->d_name, NULL, 0) != 0)
-			ret = -EIO;
+		if (!d->cpus || cpuset_file_filter(namelist[i]->d_name, d->cpus)) {
+			if (filler(buf, namelist[i]->d_name, NULL, 0) != 0)
+				ret = -EIO;
+		}
 		free(namelist[i]);
 	}
 	free(namelist);
@@ -4351,46 +4436,95 @@ int sys_access(const char *path, int mask)
 
 int sys_open(const char *path, struct fuse_file_info *fi)
 {
+	int fd;
+	int ret = 0;
+	int path_len = strlen(path);
+	int type = LXC_TYPE_SYS_FILE;
+	char *cpus = NULL, *mems = NULL;
 	struct file_info *file_info;
 	struct fuse_context *fc = fuse_get_context();
-	int fd;
 
-	if (!fc)
-		return -EIO;
+	if (!fc) {
+		ret = -EIO;
+		goto err;
+	}
+
+        /* files under /sys are readonly */
+	if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+		ret = -EACCES;
+		goto err;
+	}
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		ret = -errno;
+		goto err;
+	}
+
+	if (strcmp(path, "/sys/devices/system/cpu/online") == 0 ||
+	    strcmp(path, "/sys/devices/system/cpu/possible") == 0 ||
+	    (path_len >= 8 && strcmp(path + path_len - 8, "/cpulist") == 0) ||
+	    (path_len >= 15 && strcmp(path + path_len - 14, "/local_cpulist") == 0) ||
+	    (path_len >= 17 && strcmp(path + path_len - 16, "/cpulistaffinity") == 0))
+		type = LXC_TYPE_SYS_CPU_LIST;
+	else if (strcmp(path, "/sys/devices/system/cpu/offline") == 0)
+		type = LXC_TYPE_SYS_EMPTY;
 
 	pid_t initpid = lookup_initpid_in_store(fc->pid);
 	if (initpid <= 0)
 		initpid = fc->pid;
 
-        /* files under /sys are readonly */
-	if ((fi->flags & O_ACCMODE) != O_RDONLY)
-		return -EACCES;
+	char *cg = get_pid_cgroup(initpid, "cpuset");
+	if (cg) {
+		prune_init_slice(cg);
+		/* cpus, mems are freed in sys_releasedir */
+		cpus = get_cpuset(cg);
+		if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems))
+			mems = NULL;
+		free(cg);
+	}
 
-	if ((fd = open(path, O_RDONLY)) < 0)
-		return -errno;
+	/* TODO: */
+	if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) {
+		ret = -ENOENT;
+		goto err;
+	}
 
 	/* we'll free this at sys_release */
 	file_info = malloc(sizeof(*file_info));
 	if (!file_info) {
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err;
 	}
 	file_info->controller = NULL;
 	file_info->cgroup = NULL;
 	file_info->file = NULL;
-	file_info->type = LXC_TYPE_SYS_FILE;
+	file_info->type = type;
 	file_info->buf = NULL;
 	file_info->buflen = 0;
 	file_info->fd = fd;
+	file_info->cpus = cpus;
+	file_info->mems = mems;
 
 	fi->fh = (unsigned long)file_info;
-
 	return 0;
+
+err:
+	if (cpus)
+		free(cpus);
+	if (mems)
+		free(mems);
+	return ret;
 }
 
 int sys_release(const char *path, struct fuse_file_info *fi)
 {
 	struct file_info *file_info = (struct file_info *)fi->fh;
 	close(file_info->fd);
+	if (file_info->cpus)
+		free(file_info->cpus);
+	if (file_info->mems)
+		free(file_info->mems);
 
 	do_release_file_info(fi);
 	return 0;
@@ -4401,7 +4535,22 @@ int sys_read(const char *path, char *buf, size_t size, off_t offset,
 {
 	struct file_info *f = (struct file_info *)fi->fh;
 
-	if (f->type != LXC_TYPE_SYS_FILE) {
+	if (offset)
+		return 0;
+
+	/* TODO: cpu mask */
+	if (f->type == LXC_TYPE_SYS_CPU_LIST) {
+		if (f->cpus) {
+			buf[0] = '\0';
+			strncat(buf, f->cpus, size);
+			strncat(buf, "\n", size - strlen(buf));
+			return strlen(buf);
+		}
+	} else if (f->type == LXC_TYPE_SYS_EMPTY) {
+		buf[0] = '\n';
+		size = 1;
+		return 1;
+	} else if (f->type != LXC_TYPE_SYS_FILE) {
 		lxcfs_error("%s\n", "Internal error: directory cache info used in sys_read.");
 		return -EIO;
 	}
@@ -4412,6 +4561,8 @@ int sys_read(const char *path, char *buf, size_t size, off_t offset,
 int sys_readlink(const char *path, char *buf, size_t size)
 {
 	ssize_t nbyte;
+
+	/* TODO */
 
 	if ((nbyte = readlink(path, buf, size)) == -1)
 		return -errno;
