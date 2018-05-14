@@ -4255,64 +4255,146 @@ static inline bool cpuset_file_filter(const char *file, const char *cpus)
 	return true;
 }
 
-static bool dev_isvisible(int type, int maj, int min)
-{}
+/* static bool sys_cpuset_filter(const char *path, struct fuse_context *fc) */
+/* { */
+	/* char *cg; */
 
+	/* pid_t initpid = lookup_initpid_in_store(fc->pid); */
+	/* if (initpid <= 0) */
+		/* initpid = fc->pid; */
+
+	/* [> cpus, mems must be freed when sys_getattr returns <] */
+	/* cg = get_pid_cgroup(initpid, "cpuset"); */
+	/* if (cg) { */
+		/* prune_init_slice(cg); */
+		/* [> cpus, mems are freed in sys_releasedir <] */
+		/* cpus = get_cpuset(cg); */
+		/* if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems)) */
+			/* mems = NULL; */
+		/* free(cg); */
+	/* } */
+
+	/* if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) { */
+		/* ret = -ENOENT; */
+		/* goto err; */
+	/* } */
+/* } */
+
+static inline bool check_path(const char *path)
+{
+}
+
+static bool sys_devices_filter(const char *path, struct fuse_context *fc)
+{
+	char *cg;
+	char *line;
+	size_t len;
+	ssize_t nread;
+	FILE *stream;
+	char type;
+	char *dev_whitelist = NULL;
+	char maj[12], min[12], perms[4];
+	pid_t initpid;
+
+	int nmatch;
+	int qmaj, qmin;
+	char qtype;
+
+	int nbyte;
+	char buf0[MAXPATHLEN];
+	char buf1[MAXPATHLEN];
+
+	lxcfs_debug("%s\n", path);
+#define _X(str)  (strlen(path) > sizeof(str) - 1 && strncmp(path, (str), sizeof(str)-1) == 0)
+	if (_X("/sys/dev/block/") ||
+	    _X("/sys/class/bdi/") ||
+	    _X("/sys/devices/virtual/bdi/")) {
+		sscanf(strrchr(path, '/'), "/%d:%d", &qmaj, &qmin);
+		qtype = 'b';
+	} else if (_X("/sys/dev/char/")) {
+		sscanf(strrchr(path, '/'), "/%d:%d", &qmaj, &qmin);
+		qtype = 'c';
+	} else if (_X("/sys/class/block/") ||
+		   _X("/sys/block/") ||
+		   _X("/sys/devices/virtual/block/"))
+	{
+		buf0[0] = '\0';
+		strcat(buf0, path);
+		strcat(buf0, "/bdi");
+		nbyte = readlink(buf0, buf1, MAXPATHLEN);
+		if (nbyte == -1)
+			return true;
+		buf1[nbyte] = '\0';
+		sscanf(strrchr(buf1, '/'), "/%d:%d", &qmaj, &qmin);
+		qtype = 'b';
+	} else {
+		return true;
+	}
+#undef _X
+
+	lxcfs_debug("access: %c %d:%d\n", qtype, qmaj, qmin);
+
+	initpid = lookup_initpid_in_store(fc->pid);
+	cg = get_pid_cgroup(initpid, "devices");
+	if (cg) {
+		prune_init_slice(cg);
+		if (!cgfs_get_value("devices", cg, "devices.list", &dev_whitelist))
+			dev_whitelist = NULL;
+		free(cg);
+	} else {
+		return true;
+	}
+
+	if (!dev_whitelist)
+		return false;
+
+	lxcfs_debug("list:\n%s\n", dev_whitelist);
+
+	line = NULL;
+	stream = fmemopen(dev_whitelist, strlen(dev_whitelist), "r");
+	while ((nread = getline(&line, &len, stream)) != -1) {
+		nmatch = sscanf(line, "%c %[*0-9]:%[*0-9] %[rwm]",
+		       &type, maj, min, perms);
+
+		if ((nmatch == 4) &&
+		    (type == 'a' || qtype == type) &&
+		    (maj[0] == '*' || atoi(maj) == qmaj) &&
+		    (min[0] == '*' || atoi(min) == qmin) &&
+		    (perms[0] == 'r')) {
+			lxcfs_debug("dev match: %s\n", line);
+			free(dev_whitelist);
+			return true;
+		}
+	}
+	free(dev_whitelist);
+	/* not item matched in whitelist */
+	return false;
+}
 
 int sys_getattr(const char *path, struct stat *sb)
 {
-	int ret = 0;
-	char *cpus = NULL, *mems = NULL;
 	struct timespec now;
 	struct fuse_context *fc = fuse_get_context();
 	struct stat _sb;
 
-
 	if (!fc)
 		return -EIO;
 
-	pid_t initpid = lookup_initpid_in_store(fc->pid);
-	if (initpid <= 0)
-		initpid = fc->pid;
-
-	/* cpus, mems must be freed when sys_getattr returns */
-	char *cg = get_pid_cgroup(initpid, "cpuset");
-	if (cg) {
-		prune_init_slice(cg);
-		/* cpus, mems are freed in sys_releasedir */
-		cpus = get_cpuset(cg);
-		if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems))
-			mems = NULL;
-		free(cg);
-	}
-
-	/* TODO: */
-	if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) {
-		ret = -ENOENT;
-		goto err;
-	}
+	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
 
 	memset(sb, 0, sizeof(struct stat));
 
-	if (clock_gettime(CLOCK_REALTIME, &now) < 0) {
-		ret = -EINVAL;
-		goto err;
-	}
+	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
+		return -EINVAL;
 
-	if (lstat(path, &_sb) < 0) {
-		ret = -errno;
-		goto err;
-	}
+	if (lstat(path, &_sb) < 0)
+		return -errno;
 
 	*sb = _sb;
 	sb->st_atim = sb->st_mtim = sb->st_ctim = now;
 	sb->st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
 
-err:
-	if (cpus)
-		free(cpus);
-	if (mems)
-		free(mems);
 	return 0;
 }
 
@@ -4328,6 +4410,9 @@ int sys_opendir(const char *path, struct fuse_file_info *fi)
 		ret = -EIO;
 		goto err;
 	}
+
+	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
 
 	fd = open(path, O_DIRECTORY | O_RDONLY);
 	if (fd < 0) {
@@ -4425,8 +4510,13 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 
 int sys_access(const char *path, int mask)
 {
+	struct fuse_context *fc = fuse_get_context();
+
 	if (access(path, mask) != 0)
 		return -errno;
+
+	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
 
 	/* files under /sys are readonly */
 	if ((mask & W_OK) != 0)
@@ -4448,6 +4538,10 @@ int sys_open(const char *path, struct fuse_file_info *fi)
 		ret = -EIO;
 		goto err;
 	}
+
+	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
+
 
         /* files under /sys are readonly */
 	if ((fi->flags & O_ACCMODE) != O_RDONLY) {
