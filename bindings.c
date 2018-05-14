@@ -4280,8 +4280,21 @@ static inline bool cpuset_file_filter(const char *file, const char *cpus)
 	/* } */
 /* } */
 
-static inline bool check_path(const char *path)
+static inline bool check_path(const char *path, const char *pattern)
 {
+	int path_len = strlen(path);
+	int pattern_len = strlen(pattern);
+
+	if (path_len < pattern_len)
+		return false;
+
+	if (strncmp(path, pattern, pattern_len) != 0)
+		return false;
+
+	if (strchr(path + pattern_len, '/'))
+		return false;
+
+	return true;
 }
 
 static bool sys_devices_filter(const char *path, struct fuse_context *fc)
@@ -4305,18 +4318,18 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 	char buf1[MAXPATHLEN];
 
 	lxcfs_debug("%s\n", path);
-#define _X(str)  (strlen(path) > sizeof(str) - 1 && strncmp(path, (str), sizeof(str)-1) == 0)
-	if (_X("/sys/dev/block/") ||
-	    _X("/sys/class/bdi/") ||
-	    _X("/sys/devices/virtual/bdi/")) {
+
+	if (check_path(path, "/sys/dev/block/") ||
+	    check_path(path, "/sys/class/bdi/") ||
+	    check_path(path, "/sys/devices/virtual/bdi/")) {
 		sscanf(strrchr(path, '/'), "/%d:%d", &qmaj, &qmin);
 		qtype = 'b';
-	} else if (_X("/sys/dev/char/")) {
+	} else if (check_path(path, "/sys/dev/char/")) {
 		sscanf(strrchr(path, '/'), "/%d:%d", &qmaj, &qmin);
 		qtype = 'c';
-	} else if (_X("/sys/class/block/") ||
-		   _X("/sys/block/") ||
-		   _X("/sys/devices/virtual/block/"))
+	} else if (check_path(path, "/sys/class/block/") ||
+		   check_path(path, "/sys/block/") ||
+		   check_path(path, "/sys/devices/virtual/block/"))
 	{
 		buf0[0] = '\0';
 		strcat(buf0, path);
@@ -4330,7 +4343,6 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 	} else {
 		return true;
 	}
-#undef _X
 
 	lxcfs_debug("access: %c %d:%d\n", qtype, qmaj, qmin);
 
@@ -4347,8 +4359,6 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 
 	if (!dev_whitelist)
 		return false;
-
-	lxcfs_debug("list:\n%s\n", dev_whitelist);
 
 	line = NULL;
 	stream = fmemopen(dev_whitelist, strlen(dev_whitelist), "r");
