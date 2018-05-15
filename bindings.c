@@ -4365,7 +4365,7 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 		strcat(buf0, "/bdi");
 		nbyte = readlink(buf0, buf1, MAXPATHLEN);
 		if (nbyte == -1)
-			return true;
+			return false;
 		buf1[nbyte] = '\0';
 		sscanf(strrchr(buf1, '/'), "/%d:%d", &qmaj, &qmin);
 		qtype = 'b';
@@ -4691,8 +4691,14 @@ int sys_read(const char *path, char *buf, size_t size, off_t offset,
 int sys_readlink(const char *path, char *buf, size_t size)
 {
 	ssize_t nbyte;
+	struct fuse_context *fc = fuse_get_context();
 
-	/* TODO */
+	buf[0] = '\0';
+	if (!fc)
+		return -EIO;
+
+	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
 
 	if ((nbyte = readlink(path, buf, size)) == -1)
 		return -errno;
