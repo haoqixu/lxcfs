@@ -4342,9 +4342,11 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 	int qmaj, qmin;
 	char qtype;
 
-	int nbyte;
-	char buf0[MAXPATHLEN];
-	char buf1[MAXPATHLEN];
+	size_t nbyte;
+	char *dev = NULL;
+	ssize_t devlen;
+	char devpath[MAXPATHLEN];
+	FILE *fdev;
 
 	lxcfs_debug("%s\n", path);
 
@@ -4360,15 +4362,22 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 		   check_path(path, "/sys/block/") ||
 		   check_path(path, "/sys/devices/virtual/block/"))
 	{
-		buf0[0] = '\0';
-		strcat(buf0, path);
-		strcat(buf0, "/bdi");
-		nbyte = readlink(buf0, buf1, MAXPATHLEN);
-		if (nbyte == -1)
-			return false;
-		buf1[nbyte] = '\0';
-		sscanf(strrchr(buf1, '/'), "/%d:%d", &qmaj, &qmin);
 		qtype = 'b';
+		devpath[0] = '\0';
+		strcat(devpath, path);
+		strcat(devpath, "/dev");
+
+		fdev  = fopen(devpath, "r");
+		if (!fdev)
+			return false;
+
+		devlen = getline(&dev, &nbyte, fdev);
+		if (devlen == -1)
+			return false;
+
+		sscanf(dev, "%d:%d", &qmaj, &qmin);
+		fclose(fdev);
+		free(dev);
 	} else {
 		return true;
 	}
