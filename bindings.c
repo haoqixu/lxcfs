@@ -4280,6 +4280,41 @@ static inline bool cpuset_file_filter(const char *file, const char *cpus)
 	/* } */
 /* } */
 
+static inline bool check_rules(char qtype, int qmaj, int qmin, char *whitelist)
+{
+	bool ret;
+	char *line;
+	size_t len;
+	ssize_t nread;
+	int nmatch;
+	FILE *stream;
+	char type, maj[12], min[12], perms[4];
+
+	if (!whitelist)
+		return true;
+
+	ret = false;
+	line = NULL;
+	stream = fmemopen(whitelist, strlen(whitelist), "r");
+	while ((nread = getline(&line, &len, stream)) != -1) {
+		nmatch = sscanf(line, "%c %[*0-9]:%[*0-9] %[rwm]",
+		       &type, maj, min, perms);
+
+		if ((nmatch == 4) &&
+		    (type == 'a' || qtype == type) &&
+		    (maj[0] == '*' || atoi(maj) == qmaj) &&
+		    (min[0] == '*' || atoi(min) == qmin) &&
+		    (perms[0] == 'r')) {
+			lxcfs_debug("dev match: %s\n", line);
+			ret = true;
+			break;
+		}
+	}
+	free(line);
+	fclose(stream);
+	return ret;
+}
+
 static inline bool check_path(const char *path, const char *pattern)
 {
 	int path_len = strlen(path);
@@ -4299,17 +4334,11 @@ static inline bool check_path(const char *path, const char *pattern)
 
 static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 {
+	int ret = false;
 	char *cg;
-	char *line;
-	size_t len;
-	ssize_t nread;
-	FILE *stream;
-	char type;
 	char *dev_whitelist = NULL;
-	char maj[12], min[12], perms[4];
 	pid_t initpid;
 
-	int nmatch;
 	int qmaj, qmin;
 	char qtype;
 
@@ -4360,25 +4389,12 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 	if (!dev_whitelist)
 		return false;
 
-	line = NULL;
-	stream = fmemopen(dev_whitelist, strlen(dev_whitelist), "r");
-	while ((nread = getline(&line, &len, stream)) != -1) {
-		nmatch = sscanf(line, "%c %[*0-9]:%[*0-9] %[rwm]",
-		       &type, maj, min, perms);
+	if (check_rules(qtype, qmaj, qmin, dev_whitelist))
+		ret = true;
 
-		if ((nmatch == 4) &&
-		    (type == 'a' || qtype == type) &&
-		    (maj[0] == '*' || atoi(maj) == qmaj) &&
-		    (min[0] == '*' || atoi(min) == qmin) &&
-		    (perms[0] == 'r')) {
-			lxcfs_debug("dev match: %s\n", line);
-			free(dev_whitelist);
-			return true;
-		}
-	}
 	free(dev_whitelist);
-	/* not item matched in whitelist */
-	return false;
+	/* no item matched in whitelist */
+	return ret;
 }
 
 int sys_getattr(const char *path, struct stat *sb)
@@ -4502,9 +4518,19 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 		return -EIO;
 	}
 
-	/** TODO: implement filter function */
 	if ((n = scandir(path, &namelist, NULL, alphasort)) < 0)
 		return -errno;
+
+	struct fuse_context *fc = fuse_get_context();
+	char *dev_whitelist;
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	char *cg = get_pid_cgroup(initpid, "devices");
+	if (cg) {
+		prune_init_slice(cg);
+		if (!cgfs_get_value("devices", cg, "devices.list", &dev_whitelist))
+			dev_whitelist = NULL;
+		free(cg);
+	}
 
 	ret = 0;
 	for (i = 0; i < n; i++) {
