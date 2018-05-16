@@ -4372,11 +4372,11 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 			return false;
 
 		devlen = getline(&dev, &nbyte, fdev);
+		fclose(fdev);
 		if (devlen == -1)
 			return false;
 
 		sscanf(dev, "%d:%d", &qmaj, &qmin);
-		fclose(fdev);
 		free(dev);
 	} else {
 		return true;
@@ -4518,19 +4518,20 @@ int sys_releasedir(const char *path, struct fuse_file_info *fi)
 int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
 		struct fuse_file_info *fi)
 {
-	int n, i, ret;
-	struct dirent **namelist;
+	int ret;
+	DIR *dirp;
+	struct dirent *dp;
 	struct file_info *d = (struct file_info *)fi->fh;
+	struct fuse_context *fc = fuse_get_context();
+
+	if (!fc)
+		return -EIO;
 
 	if (d->type != LXC_TYPE_SYS_DIR) {
 		lxcfs_error("%s\n", "Internal error: file cache info used in readdir.");
 		return -EIO;
 	}
 
-	if ((n = scandir(path, &namelist, NULL, alphasort)) < 0)
-		return -errno;
-
-	struct fuse_context *fc = fuse_get_context();
 	char *dev_whitelist;
 	pid_t initpid = lookup_initpid_in_store(fc->pid);
 	char *cg = get_pid_cgroup(initpid, "devices");
@@ -4541,15 +4542,97 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 		free(cg);
 	}
 
-	ret = 0;
-	for (i = 0; i < n; i++) {
-		if (!d->cpus || cpuset_file_filter(namelist[i]->d_name, d->cpus)) {
-			if (filler(buf, namelist[i]->d_name, NULL, 0) != 0)
-				ret = -EIO;
-		}
-		free(namelist[i]);
+	if ((dirp = opendir(path)) == NULL) {
+		ret = -errno;
+		goto err;
 	}
-	free(namelist);
+
+	enum {
+		NOTDEV = 0,
+		BLOCK_FILENAME,
+		BLOCK_DEVCONT,
+		CHAR_FILENAME,
+		CHAR_DEVCONT,
+	} dev_type = NOTDEV;
+
+	if (strcmp(path, "/sys/dev/block") == 0 ||
+	    strcmp(path, "/sys/class/bdi") == 0 ||
+	    strcmp(path, "/sys/devices/virtual/bdi") == 0) {
+		dev_type = BLOCK_FILENAME;
+	} else if (strcmp(path, "/sys/dev/char") == 0) {
+		dev_type = CHAR_FILENAME;
+	} else if (strcmp(path, "/sys/class/block") == 0 ||
+		   strcmp(path, "/sys/block") == 0 ||
+		   strcmp(path, "/sys/devices/virtual/block") == 0) {
+		dev_type = BLOCK_DEVCONT;
+	}
+
+	ret = 0;
+	char qtype;
+	int qmaj, qmin;
+	char devpath[MAXPATHLEN];
+	FILE *fdev;
+	char *dev;
+	size_t nbyte;
+	ssize_t devlen;
+	while ((dp = readdir(dirp))) {
+		if (d->cpus && !cpuset_file_filter(dp->d_name, d->cpus))
+			continue;
+
+		lxcfs_debug("%s\n", dp->d_name);
+
+		switch (dev_type) {
+		case BLOCK_FILENAME:
+			qtype = 'b';
+			sscanf(dp->d_name, "%d:%d", &qmaj, &qmin);
+			break;
+		case BLOCK_DEVCONT:
+			qtype = 'b';
+			sprintf(devpath, "%s/%s/dev", path, dp->d_name);
+			fdev  = fopen(devpath, "r");
+			if (!fdev)
+				continue;
+			dev = NULL;
+			devlen = getline(&dev, &nbyte, fdev);
+			fclose(fdev);
+			if (devlen == -1)
+				continue;
+			sscanf(dev, "%d:%d", &qmaj, &qmin);
+			free(dev);
+			break;
+		case CHAR_FILENAME:
+			qtype = 'c';
+			sscanf(dp->d_name, "%d:%d", &qmaj, &qmin);
+			break;
+		case CHAR_DEVCONT:
+			qtype = 'c';
+			sprintf(devpath, "%s/%s/dev", path, dp->d_name);
+			fdev  = fopen(devpath, "r");
+			if (!fdev)
+				continue;
+			dev = NULL;
+			devlen = getline(&dev, &nbyte, fdev);
+			fclose(fdev);
+			if (devlen == -1)
+				continue;
+			sscanf(dev, "%d:%d", &qmaj, &qmin);
+			free(dev);
+			break;
+		case NOTDEV: default:
+			break;
+		}
+
+		if (dev_type != NOTDEV &&
+		   !check_rules(qtype, qmaj, qmin, dev_whitelist))
+			continue;
+
+		if (filler(buf, dp->d_name, NULL, 0) != 0)
+			ret = -EIO;
+	}
+
+	closedir(dirp);
+err:
+	free(dev_whitelist);
 	return ret;
 }
 
