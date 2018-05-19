@@ -4246,7 +4246,7 @@ int proc_read(const char *path, char *buf, size_t size, off_t offset,
  * FUSE ops for /sys
  */
 
-static inline bool cpuset_file_filter(const char *file, const char *cpus)
+static inline bool cpuset_cpu_filter(const char *file, const char *cpus)
 {
 	int cpu;
 
@@ -4255,30 +4255,54 @@ static inline bool cpuset_file_filter(const char *file, const char *cpus)
 	return true;
 }
 
-/* static bool sys_cpuset_filter(const char *path, struct fuse_context *fc) */
-/* { */
-	/* char *cg; */
+static inline bool cpuset_node_filter(const char *file, const char *mems)
+{
+	int node;
 
-	/* pid_t initpid = lookup_initpid_in_store(fc->pid); */
-	/* if (initpid <= 0) */
-		/* initpid = fc->pid; */
+	if (sscanf(file, "node%d", &node) == 1 && !cpu_in_cpuset(node, mems))
+		return false;
+	return true;
+}
 
-	/* [> cpus, mems must be freed when sys_getattr returns <] */
-	/* cg = get_pid_cgroup(initpid, "cpuset"); */
-	/* if (cg) { */
-		/* prune_init_slice(cg); */
-		/* [> cpus, mems are freed in sys_releasedir <] */
-		/* cpus = get_cpuset(cg); */
-		/* if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems)) */
-			/* mems = NULL; */
-		/* free(cg); */
-	/* } */
+static bool sys_cpuset_filter(const char *path, struct fuse_context *fc)
+{
+	int ret = true;
+	char *cg;
+	char *cpus;
+	int cpu, node;
+	char *mems;
 
-	/* if (cpus && strcmp("/sys/devices/system/cpu/cpu0", path) == 0) { */
-		/* ret = -ENOENT; */
-		/* goto err; */
-	/* } */
-/* } */
+	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	if (initpid <= 0)
+		initpid = fc->pid;
+
+	cg = get_pid_cgroup(initpid, "cpuset");
+	if (cg) {
+		prune_init_slice(cg);
+		cpus = get_cpuset(cg);
+		if (!cgfs_get_value("cpuset", cg, "cpuset.mems", &mems))
+			mems = NULL;
+		free(cg);
+	}
+
+	if (cpus && sscanf(strrchr(path, '/'), "/cpu%d", &cpu) == 1 &&
+	   !cpu_in_cpuset(cpu, cpus))
+	{
+		ret = false;
+		goto out;
+	}
+
+	if (mems && sscanf(strrchr(path, '/'), "/node%d", &node) == 1 &&
+	   !cpu_in_cpuset(node, mems))
+		ret = false;
+
+out:
+	if (cpus)
+		free(cpus);
+	if (mems)
+		free(mems);
+	return ret;
+}
 
 static inline bool check_rules(char qtype, int qmaj, int qmin, char *whitelist)
 {
@@ -4418,6 +4442,9 @@ int sys_getattr(const char *path, struct stat *sb)
 	if (!sys_devices_filter(path, fc))
 		return -ENOENT;
 
+	if (!sys_cpuset_filter(path, fc))
+		return -ENOENT;
+
 	memset(sb, 0, sizeof(struct stat));
 
 	if (clock_gettime(CLOCK_REALTIME, &now) < 0)
@@ -4447,6 +4474,9 @@ int sys_opendir(const char *path, struct fuse_file_info *fi)
 	}
 
 	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
+
+	if (!sys_cpuset_filter(path, fc))
 		return -ENOENT;
 
 	fd = open(path, O_DIRECTORY | O_RDONLY);
@@ -4576,7 +4606,10 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 	size_t nbyte;
 	ssize_t devlen;
 	while ((dp = readdir(dirp))) {
-		if (d->cpus && !cpuset_file_filter(dp->d_name, d->cpus))
+		if (d->cpus && !cpuset_cpu_filter(dp->d_name, d->cpus))
+			continue;
+
+		if (d->mems && !cpuset_node_filter(dp->d_name, d->mems))
 			continue;
 
 		lxcfs_debug("%s\n", dp->d_name);
@@ -4646,6 +4679,9 @@ int sys_access(const char *path, int mask)
 	if (!sys_devices_filter(path, fc))
 		return -ENOENT;
 
+	if (!sys_cpuset_filter(path, fc))
+		return -ENOENT;
+
 	/* files under /sys are readonly */
 	if ((mask & W_OK) != 0)
 		return -EACCES;
@@ -4670,6 +4706,9 @@ int sys_open(const char *path, struct fuse_file_info *fi)
 	if (!sys_devices_filter(path, fc))
 		return -ENOENT;
 
+
+	if (!sys_cpuset_filter(path, fc))
+		return -ENOENT;
 
         /* files under /sys are readonly */
 	if ((fi->flags & O_ACCMODE) != O_RDONLY) {
@@ -4790,6 +4829,9 @@ int sys_readlink(const char *path, char *buf, size_t size)
 		return -EIO;
 
 	if (!sys_devices_filter(path, fc))
+		return -ENOENT;
+
+	if (!sys_cpuset_filter(path, fc))
 		return -ENOENT;
 
 	if ((nbyte = readlink(path, buf, size)) == -1)
