@@ -4730,6 +4730,11 @@ int sys_open(const char *path, struct fuse_file_info *fi)
 		type = LXC_TYPE_SYS_CPU_LIST;
 	else if (strcmp(path, "/sys/devices/system/cpu/offline") == 0)
 		type = LXC_TYPE_SYS_EMPTY;
+	else if (path_len >= 7 && strcmp(path + path_len - 7, "/cpumap") == 0)
+		type = LXC_TYPE_SYS_CPU_MAP;
+	else if (strcmp(path, "/sys/devices/system/node/online") == 0 ||
+		 strcmp(path, "/sys/devices/system/node/possible") == 0)
+		type = LXC_TYPE_SYS_MEM_LIST;
 
 	pid_t initpid = lookup_initpid_in_store(fc->pid);
 	if (initpid <= 0)
@@ -4791,6 +4796,8 @@ int sys_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
+void list2map(const char *cpuset, char *buf);
+
 int sys_read(const char *path, char *buf, size_t size, off_t offset,
 		struct fuse_file_info *fi)
 {
@@ -4807,10 +4814,22 @@ int sys_read(const char *path, char *buf, size_t size, off_t offset,
 			strncat(buf, "\n", size - strlen(buf));
 			return strlen(buf);
 		}
+	} else if (f->type == LXC_TYPE_SYS_CPU_MAP) {
+		if (f->cpus) {
+			list2map(f->cpus, buf);
+			return strlen(buf);
+		}
 	} else if (f->type == LXC_TYPE_SYS_EMPTY) {
 		buf[0] = '\n';
 		size = 1;
 		return 1;
+	} else if (f->type == LXC_TYPE_SYS_MEM_LIST) {
+		if (f->mems) {
+			buf[0] = '\0';
+			strncat(buf, f->mems, size);
+			strncat(buf, "\n", size - strlen(buf));
+			return strlen(buf);
+		}
 	} else if (f->type != LXC_TYPE_SYS_FILE) {
 		lxcfs_error("%s\n", "Internal error: directory cache info used in sys_read.");
 		return -EIO;
