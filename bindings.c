@@ -4252,6 +4252,10 @@ static inline bool cpuset_cpu_filter(const char *file, const char *cpus)
 
 	if (sscanf(file, "cpu%d", &cpu) == 1 && !cpu_in_cpuset(cpu, cpus))
 		return false;
+
+	if (sscanf(file, "policy%d", &cpu) == 1 && !cpu_in_cpuset(cpu, cpus))
+		return false;
+
 	return true;
 }
 
@@ -4286,6 +4290,13 @@ static bool sys_cpuset_filter(const char *path, struct fuse_context *fc)
 	}
 
 	if (cpus && sscanf(strrchr(path, '/'), "/cpu%d", &cpu) == 1 &&
+	   !cpu_in_cpuset(cpu, cpus))
+	{
+		ret = false;
+		goto out;
+	}
+
+	if (cpus && sscanf(strrchr(path, '/'), "/policy%d", &cpu) == 1 &&
 	   !cpu_in_cpuset(cpu, cpus))
 	{
 		ret = false;
