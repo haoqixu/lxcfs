@@ -4413,7 +4413,11 @@ static bool sys_devices_filter(const char *path, struct fuse_context *fc)
 
 		sscanf(dev, "%d:%d", &qmaj, &qmin);
 		free(dev);
-	} else if (check_path(path, "/sys/devices/virtual/mem/") ||
+	} else if (check_path(path, "/sys/class/mem/") ||
+		   check_path(path, "/sys/class/tty/") ||
+		   check_path(path, "/sys/class/misc/") ||
+		   check_path(path, "/sys/class/vc/") ||
+		   check_path(path, "/sys/devices/virtual/mem/") ||
 		   check_path(path, "/sys/devices/virtual/tty/") ||
 		   check_path(path, "/sys/devices/virtual/misc/") ||
 		   check_path(path, "/sys/devices/virtual/sound/") ||
@@ -4628,7 +4632,11 @@ int sys_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 		   strcmp(path, "/sys/block") == 0 ||
 		   strcmp(path, "/sys/devices/virtual/block") == 0) {
 		dev_type = BLOCK_DEVCONT;
-	} else if (strcmp(path, "/sys/devices/virtual/mem") == 0 ||
+	} else if (strcmp(path, "/sys/class/mem") == 0 ||
+		   strcmp(path, "/sys/class/tty") == 0 ||
+		   strcmp(path, "/sys/class/misc") == 0 ||
+		   strcmp(path, "/sys/class/vc") == 0 ||
+		   strcmp(path, "/sys/devices/virtual/mem") == 0 ||
 		   strcmp(path, "/sys/devices/virtual/tty") == 0 ||
 		   strcmp(path, "/sys/devices/virtual/misc") == 0 ||
 		   strcmp(path, "/sys/devices/virtual/sound") == 0 ||
